@@ -1,0 +1,23 @@
+{
+  "name": "expense-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amiirbazzii/expense-manager-bot.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/amiirbazzii/expense-manager-bot/issues"
+  },
+  "homepage": "https://github.com/amiirbazzii/expense-manager-bot#readme",
+  "dependencies": {
+    "convex": "^1.24.1"
+  }
+}
