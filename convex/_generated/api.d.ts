@@ -15,6 +15,7 @@ import type {
 } from "convex/server";
 import type * as auth from "../auth.js";
 import type * as expenses from "../expenses.js";
+import type * as queries from "../queries.js";
 
 /**
  * A utility for referencing Convex functions in your app's API.
@@ -27,6 +28,7 @@ import type * as expenses from "../expenses.js";
 declare const fullApi: ApiFromModules<{
   auth: typeof auth;
   expenses: typeof expenses;
+  queries: typeof queries;
 }>;
 export declare const api: FilterApi<
   typeof fullApi,
