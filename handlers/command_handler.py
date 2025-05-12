@@ -1,7 +1,7 @@
 # handlers/command_handler.py
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone # Added timezone
 from typing import Optional
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -11,6 +11,7 @@ from utils.parsing_utils import parse_date_to_timestamp, determine_category, par
 
 logger = logging.getLogger(__name__)
 
+# log_command_v2 (from previous steps, ensure it's complete and correct)
 async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
                          convex_client: any, nlp_processor: any,
                          predefined_categories: dict, default_category: str) -> None:
@@ -33,21 +34,16 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
     amount: Optional[float] = None
     amount_text_for_removal = ""
 
-    # 1. Try to find MONEY entity first
     for ent in doc.ents:
         if ent.label_ == "MONEY":
             logger.info(f"Processing MONEY entity: '{ent.text}' (start: {ent.start_char}, end: {ent.end_char})")
             try:
-                # Clean common currency symbols and commas from spaCy's entity text
                 cleaned_entity_text = ent.text.replace("$", "").replace("€", "").replace("£", "").replace(",", "").strip()
                 parsed_val = float(cleaned_entity_text)
-
                 if parsed_val > 0:
                     amount = parsed_val
-                    # Construct amount_text_for_removal carefully to include symbol
-                    potential_removal_text = ent.text # Start with what spaCy gave
+                    potential_removal_text = ent.text
                     entity_start_char = ent.start_char
-                    # Check if symbol is missing from ent.text but present in original
                     if not any(c in potential_removal_text for c in "$€£"):
                         if entity_start_char > 0 and full_text_after_log[entity_start_char - 1] in "$€£":
                             potential_removal_text = full_text_after_log[entity_start_char - 1] + potential_removal_text
@@ -59,14 +55,13 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
             except ValueError:
                 logger.warning(f"Could not convert MONEY entity text '{ent.text}' (cleaned: '{cleaned_entity_text}') to float.")
     
-    # 2. If no MONEY, try CARDINAL entity
     if amount is None:
         logger.info("No MONEY entity parsed, trying CARDINAL.")
         for ent in doc.ents:
             if ent.label_ == "CARDINAL":
                 logger.info(f"Processing CARDINAL entity: '{ent.text}' (start: {ent.start_char}, end: {ent.end_char})")
                 is_part_of_date = False
-                for date_ent in doc.ents: # Avoid cardinals that are part of dates
+                for date_ent in doc.ents:
                     if date_ent.label_ == "DATE" and ent.start_char >= date_ent.start_char and ent.end_char <= date_ent.end_char:
                         is_part_of_date = True
                         break
@@ -78,10 +73,9 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     parsed_val = float(cleaned_cardinal_str)
                     if parsed_val > 0:
                         amount = parsed_val
-                        # Construct amount_text_for_removal carefully
                         potential_removal_text = ent.text
                         entity_start_char = ent.start_char
-                        if not any(c in potential_removal_text for c in "$€£"): # Should be true for CARDINAL
+                        if not any(c in potential_removal_text for c in "$€£"):
                             if entity_start_char > 0 and full_text_after_log[entity_start_char - 1] in "$€£":
                                 potential_removal_text = full_text_after_log[entity_start_char - 1] + potential_removal_text
                             elif entity_start_char > 1 and full_text_after_log[entity_start_char - 2] in "$€£" and full_text_after_log[entity_start_char - 1].isspace():
@@ -92,7 +86,6 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 except ValueError:
                     logger.warning(f"Could not convert CARDINAL entity '{ent.text}' to float.")
 
-    # 3. If still no amount, use improved regex fallback
     if amount is None:
         logger.info("No amount from spaCy MONEY/CARDINAL entities, trying regex fallback.")
         money_match = re.search(r"([\$€£]?)\s*(\d+(?:[\.,]\d+)?(?:\d+)?)", full_text_after_log)
@@ -104,7 +97,7 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 parsed_val = float(cleaned_amount_str)
                 if parsed_val > 0:
                     amount = parsed_val
-                    amount_text_for_removal = money_match.group(0).strip() # Full match for removal
+                    amount_text_for_removal = money_match.group(0).strip()
                     logger.info(f"Found amount from regex: {amount}, text for removal: '{amount_text_for_removal}'")
             except ValueError:
                 logger.warning(f"Could not convert regex-found amount '{money_match.group(0)}' to float.")
@@ -116,22 +109,18 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
     
     logger.info(f"--- End Amount Extraction: Amount={amount}, TextForRemoval='{amount_text_for_removal}' ---")
 
-    # --- Date Extraction ---
     expense_timestamp = parse_date_to_timestamp(None, full_text_after_log, nlp_processor)
 
-    # --- Category and Description Logic ---
     text_for_category_desc = full_text_after_log
     logger.info(f"Initial text for cat/desc: '{text_for_category_desc}'")
 
-    # Remove the identified amount string for description generation
     if amount_text_for_removal:
         logger.info(f"Attempting to remove amount text: '{amount_text_for_removal}'")
-        # Construct a more careful regex for removal
         removal_pattern_parts = []
-        if amount_text_for_removal[0].isalnum(): # Leading word boundary if starts with alphanum
+        if amount_text_for_removal[0].isalnum():
             removal_pattern_parts.append(r'\b')
         removal_pattern_parts.append(re.escape(amount_text_for_removal))
-        if amount_text_for_removal[-1].isalnum(): # Trailing word boundary if ends with alphanum
+        if amount_text_for_removal[-1].isalnum():
             removal_pattern_parts.append(r'\b')
         removal_regex = "".join(removal_pattern_parts)
         
@@ -139,8 +128,6 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
         text_for_category_desc = re.sub(r'\s+', ' ', text_for_category_desc).strip()
         logger.info(f"Text after amount removal: '{text_for_category_desc}'")
 
-
-    # Also try to remove date entities from text
     date_entity_texts = [ent.text for ent in doc.ents if ent.label_ == "DATE"]
     for date_txt in date_entity_texts:
         logger.info(f"Attempting to remove date text: '{date_txt}'")
@@ -154,12 +141,10 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
         text_for_category_desc = re.sub(r'\s+', ' ', text_for_category_desc).strip()
         logger.info(f"Text after removing '{date_txt}': '{text_for_category_desc}'")
 
-    # Final cleanup of common leading/trailing prepositions and keywords
     text_for_category_desc = re.sub(r'^(on|for|at|spent|buy|bought|get|got)\s+', '', text_for_category_desc, flags=re.IGNORECASE).strip()
     text_for_category_desc = re.sub(r'\s+(on|for|at)$', '', text_for_category_desc, flags=re.IGNORECASE).strip()
-    text_for_category_desc = re.sub(r'\s+', ' ', text_for_category_desc).strip() # Consolidate spaces again
+    text_for_category_desc = re.sub(r'\s+', ' ', text_for_category_desc).strip()
     logger.info(f"Text after preposition cleanup: '{text_for_category_desc}'")
-
 
     category = determine_category(text_for_category_desc if text_for_category_desc else full_text_after_log, 
                                   nlp_processor, predefined_categories, default_category)
@@ -174,7 +159,6 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not description.strip() or len(description.strip()) < 2 :
         temp_desc = full_text_after_log
         if amount_text_for_removal:
-            # Re-construct removal_regex for amount
             ar_parts = []
             if amount_text_for_removal[0].isalnum(): ar_parts.append(r'\b')
             ar_parts.append(re.escape(amount_text_for_removal))
@@ -191,7 +175,7 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
             temp_desc = re.sub(dr_regex, '', temp_desc, 1, flags=re.IGNORECASE).strip()
         
         temp_desc = re.sub(r'\s+', ' ', temp_desc).strip()
-        temp_desc = re.sub(r'^(on|for|at|spent|buy|bought|get|got)\s+', '', temp_desc, flags=re.IGNORECASE).strip() # Clean leading keywords
+        temp_desc = re.sub(r'^(on|for|at|spent|buy|bought|get|got)\s+', '', temp_desc, flags=re.IGNORECASE).strip()
         
         if temp_desc and len(temp_desc.strip()) > 2:
             description = temp_desc[:75].strip() + ("..." if len(temp_desc) > 75 else "")
@@ -201,9 +185,8 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
             description = "Logged expense"
     
     description = description.strip()
-    if not description: # Final fallback if it somehow became empty
+    if not description:
         description = "Logged expense"
-
 
     expense_data = {
         "telegramChatId": telegram_chat_id,
@@ -234,12 +217,9 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
         logger.error(f"Error calling Convex logExpense mutation (v3 improved): {e}")
         await update.message.reply_text(f"⚠️ An error occurred while logging your expense: {str(e)}")
 
-
+# summary_command (from previous steps, ensure it's complete and correct)
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
                           convex_client: any, nlp_processor: any) -> None:
-    # This function remains the same as in the previous version.
-    # For brevity, I'm not repeating it here. Ensure it's correctly defined
-    # from the  artifact.
     telegram_chat_id = str(update.message.from_user.id)
     args_str = update.message.text.split('/summary', 1)[1].strip() if '/summary' in update.message.text else ""
     
@@ -309,15 +289,8 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
             display_period = f"This Month ({display_period_start_dt.strftime('%B %Y')})"
         elif period_str.lower() == "last month":
             display_period = f"Last Month ({display_period_start_dt.strftime('%B %Y')})"
-        # Check if the original period_str was just a month name or "Month Year"
-        # Ensure calendar is imported in parsing_utils if this part of logic is there, or here
-        # For now, assuming calendar is available globally if parse_period_to_date_range doesn't use it directly
-        # but this display logic does.
-        # The calendar.monthrange was in the global scope of the previous bot.py.
-        # It's better if parse_period_to_date_range returns more structured info or this logic is simplified.
-        # For now, a basic check:
         elif display_period_start_dt.day == 1 and \
-             (lambda y, m: display_period_end_dt.day == calendar.monthrange(y, m)[1])(display_period_end_dt.year, display_period_end_dt.month):
+             (lambda y, m: hasattr(calendar, 'monthrange') and display_period_end_dt.day == calendar.monthrange(y, m)[1])(display_period_end_dt.year, display_period_end_dt.month):
             display_period = display_period_start_dt.strftime("%B %Y")
 
 
@@ -339,7 +312,7 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
             total_amount = summary_result.get("totalAmount", 0.0)
             
             response_message = f"📊 Expense Summary for {display_period}:\n"
-            if summary_result.get("category"): # Use category from result for consistency
+            if summary_result.get("category"):
                 response_message += f"Category: {summary_result['category']}\n"
             response_message += f"Total Expenses: {count}\n"
             response_message += f"Total Amount: ${total_amount:.2f}"
@@ -354,3 +327,69 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
              await update.message.reply_text(f"⚠️ Error: The summary function was not found on the server. Please check backend deployment.")
         else:
             await update.message.reply_text(f"⚠️ An error occurred while fetching your summary: {str(e)}")
+
+# --- New /details Command Handler ---
+async def details_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          convex_client: any) -> None:
+    """Handles the /details command to show recent expenses."""
+    telegram_chat_id = str(update.message.from_user.id)
+    args = context.args # Get arguments passed to the command
+
+    limit = 5 # Default limit
+    if args:
+        try:
+            limit = int(args[0])
+            if not (1 <= limit <= 50) : # Max 50 for sanity, min 1
+                await update.message.reply_text("Please provide a limit between 1 and 50.")
+                return
+        except ValueError:
+            await update.message.reply_text("Invalid limit. Please provide a number (e.g., /details 10).")
+            return
+        except IndexError: # Should not happen if args is checked, but good practice
+            pass 
+    
+    logger.info(f"User {telegram_chat_id} requested /details with limit: {limit}")
+    await update.message.reply_text(f"Fetching your last {limit} expenses...")
+
+    try:
+        query_args = {"telegramChatId": telegram_chat_id, "limit": limit}
+        recent_expenses = convex_client.query("queries:getRecentExpenses", query_args)
+
+        if recent_expenses:
+            if not recent_expenses: # Check if the list is empty
+                await update.message.reply_text("You have no expenses logged yet.")
+                return
+
+            response_message = f"📜 Your Last {len(recent_expenses)} Expenses:\n"
+            response_message += "------------------------------------\n"
+            for expense in recent_expenses:
+                # Convert timestamp (milliseconds) to datetime object, then format
+                # Ensure the timestamp is correctly interpreted (e.g. if it's in seconds, multiply by 1000)
+                # Convex stores as milliseconds from epoch by default with v.number() for dates usually.
+                try:
+                    expense_date = datetime.fromtimestamp(expense['date'] / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
+                except TypeError: # Handle if date is None or not a number
+                    expense_date = "N/A"
+                
+                desc = expense.get('description', 'N/A') or "N/A" # Ensure description is never None for display
+                
+                response_message += (
+                    f"🗓️ Date: {expense_date}\n"
+                    f"💰 Amount: ${expense['amount']:.2f}\n"
+                    f"🏷️ Category: {expense['category']}\n"
+                    f"📝 Desc: {desc}\n"
+                    f"------------------------------------\n"
+                )
+            await update.message.reply_text(response_message)
+        else: # This case might mean the query returned None or an empty list explicitly handled above
+            await update.message.reply_text("Could not retrieve recent expenses. No data found or an error occurred.")
+
+    except Exception as e:
+        logger.error(f"Error calling Convex getRecentExpenses query: {e}")
+        if "Limit must be between 1 and 50" in str(e): # Catch specific validation error from Convex
+            await update.message.reply_text(str(e))
+        elif "User not found" in str(e):
+            await update.message.reply_text("User not found. Please /start or /register first.")
+        else:
+            await update.message.reply_text(f"⚠️ An error occurred while fetching your recent expenses: {str(e)}")
+
