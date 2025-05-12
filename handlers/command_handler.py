@@ -1,7 +1,8 @@
 # handlers/command_handler.py
 import logging
 import re
-from datetime import datetime, timezone # Added timezone
+from datetime import datetime, timezone, date # Added date for type hint consistency
+import calendar # For calendar.monthrange, ensure it's available
 from typing import Optional
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -11,7 +12,7 @@ from utils.parsing_utils import parse_date_to_timestamp, determine_category, par
 
 logger = logging.getLogger(__name__)
 
-# log_command_v2 (from previous steps, ensure it's complete and correct)
+# log_command_v2 (from previous steps)
 async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
                          convex_client: any, nlp_processor: any,
                          predefined_categories: dict, default_category: str) -> None:
@@ -217,7 +218,7 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
         logger.error(f"Error calling Convex logExpense mutation (v3 improved): {e}")
         await update.message.reply_text(f"⚠️ An error occurred while logging your expense: {str(e)}")
 
-# summary_command (from previous steps, ensure it's complete and correct)
+# summary_command (from previous steps)
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
                           convex_client: any, nlp_processor: any) -> None:
     telegram_chat_id = str(update.message.from_user.id)
@@ -293,7 +294,6 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
              (lambda y, m: hasattr(calendar, 'monthrange') and display_period_end_dt.day == calendar.monthrange(y, m)[1])(display_period_end_dt.year, display_period_end_dt.month):
             display_period = display_period_start_dt.strftime("%B %Y")
 
-
     query_args = {
         "telegramChatId": telegram_chat_id,
         "startDate": start_timestamp_ms,
@@ -320,7 +320,6 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await update.message.reply_text(response_message)
         else:
             await update.message.reply_text("Could not retrieve summary. No data found or an error occurred.")
-
     except Exception as e:
         logger.error(f"Error calling Convex getExpenseSummary query: {e}")
         if "Function not found" in str(e):
@@ -328,24 +327,23 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
         else:
             await update.message.reply_text(f"⚠️ An error occurred while fetching your summary: {str(e)}")
 
-# --- New /details Command Handler ---
+# details_command (from previous steps)
 async def details_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
                           convex_client: any) -> None:
-    """Handles the /details command to show recent expenses."""
     telegram_chat_id = str(update.message.from_user.id)
-    args = context.args # Get arguments passed to the command
+    args = context.args 
 
-    limit = 5 # Default limit
+    limit = 5 
     if args:
         try:
             limit = int(args[0])
-            if not (1 <= limit <= 50) : # Max 50 for sanity, min 1
+            if not (1 <= limit <= 50) : 
                 await update.message.reply_text("Please provide a limit between 1 and 50.")
                 return
         except ValueError:
             await update.message.reply_text("Invalid limit. Please provide a number (e.g., /details 10).")
             return
-        except IndexError: # Should not happen if args is checked, but good practice
+        except IndexError: 
             pass 
     
     logger.info(f"User {telegram_chat_id} requested /details with limit: {limit}")
@@ -356,40 +354,173 @@ async def details_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
         recent_expenses = convex_client.query("queries:getRecentExpenses", query_args)
 
         if recent_expenses:
-            if not recent_expenses: # Check if the list is empty
+            if not recent_expenses: 
                 await update.message.reply_text("You have no expenses logged yet.")
                 return
 
             response_message = f"📜 Your Last {len(recent_expenses)} Expenses:\n"
             response_message += "------------------------------------\n"
             for expense in recent_expenses:
-                # Convert timestamp (milliseconds) to datetime object, then format
-                # Ensure the timestamp is correctly interpreted (e.g. if it's in seconds, multiply by 1000)
-                # Convex stores as milliseconds from epoch by default with v.number() for dates usually.
                 try:
-                    expense_date = datetime.fromtimestamp(expense['date'] / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
-                except TypeError: # Handle if date is None or not a number
-                    expense_date = "N/A"
+                    # Assuming expense['date'] is a timestamp in milliseconds
+                    expense_date_obj = datetime.fromtimestamp(expense['date'] / 1000, tz=timezone.utc)
+                    expense_date_str = expense_date_obj.strftime('%Y-%m-%d (%a)') # e.g. 2023-10-26 (Thu)
+                except (TypeError, ValueError): 
+                    expense_date_str = "N/A"
                 
-                desc = expense.get('description', 'N/A') or "N/A" # Ensure description is never None for display
+                desc = expense.get('description', 'N/A') or "N/A" 
                 
                 response_message += (
-                    f"🗓️ Date: {expense_date}\n"
+                    f"🗓️ Date: {expense_date_str}\n"
                     f"💰 Amount: ${expense['amount']:.2f}\n"
                     f"🏷️ Category: {expense['category']}\n"
                     f"📝 Desc: {desc}\n"
                     f"------------------------------------\n"
                 )
             await update.message.reply_text(response_message)
-        else: # This case might mean the query returned None or an empty list explicitly handled above
+        else: 
             await update.message.reply_text("Could not retrieve recent expenses. No data found or an error occurred.")
 
     except Exception as e:
         logger.error(f"Error calling Convex getRecentExpenses query: {e}")
-        if "Limit must be between 1 and 50" in str(e): # Catch specific validation error from Convex
+        if "Limit must be between 1 and 50" in str(e): 
             await update.message.reply_text(str(e))
         elif "User not found" in str(e):
             await update.message.reply_text("User not found. Please /start or /register first.")
         else:
             await update.message.reply_text(f"⚠️ An error occurred while fetching your recent expenses: {str(e)}")
+
+
+# --- New /category Command Handler ---
+async def category_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           convex_client: any, nlp_processor: any,
+                           predefined_categories: dict) -> None:
+    """Handles the /category command to show expense summaries for a specific category."""
+    telegram_chat_id = str(update.message.from_user.id)
+    args_text = " ".join(context.args) if context.args else ""
+    
+    logger.info(f"User {telegram_chat_id} sent /category command with args: '{args_text}'")
+
+    if not args_text:
+        await update.message.reply_text(
+            "Please specify a category and optionally a period.\n"
+            "Example: /category Food\n"
+            "Example: /category Shopping last month"
+        )
+        return
+
+    # Attempt to parse category and period from args_text
+    # This parsing logic is similar to /summary but assumes the first part is more likely a category.
+    
+    target_category: Optional[str] = None
+    period_str: Optional[str] = "this month" # Default period
+
+    # Try to match known categories first (case-insensitive)
+    # This helps if category names are multi-word
+    found_category_from_predefined = False
+    temp_args_lower = args_text.lower()
+    
+    # Check against PREDEFINED_CATEGORIES keys (the actual category names)
+    # We want to match the user's input category to one of our defined category names.
+    # The `determine_category` function in parsing_utils uses keywords. Here we need to match the category name itself.
+    
+    # A simple approach: iterate through predefined category names
+    # and see if the beginning of args_text matches one of them.
+    
+    # A more robust way is to extract the category first, then the period.
+    # Let's assume the category might be one or more words at the beginning.
+    
+    words = args_text.split()
+    potential_category_parts = []
+    remaining_words_for_period = []
+
+    # Iterate through words to find a matching category from PREDEFINED_CATEGORIES
+    # This is a simple greedy match from the beginning.
+    current_best_match_category = None
+    longest_match_len = 0
+
+    for i in range(1, len(words) + 1):
+        potential_cat_phrase = " ".join(words[:i]).lower()
+        for cat_name in predefined_categories.keys():
+            if cat_name.lower() == potential_cat_phrase:
+                if len(potential_cat_phrase) > longest_match_len:
+                    current_best_match_category = cat_name # Use the actual casing from PREDEFINED_CATEGORIES
+                    longest_match_len = len(potential_cat_phrase)
+                    remaining_words_for_period = words[i:]
+    
+    if current_best_match_category:
+        target_category = current_best_match_category
+        if remaining_words_for_period:
+            period_str = " ".join(remaining_words_for_period).strip()
+        else:
+            period_str = "this month" # Default if only category is given
+    else:
+        # If no predefined category name matches the start, assume the first word is the category
+        # and the rest is the period. This is a fallback.
+        if words:
+            target_category = words[0].capitalize() # Capitalize for consistency if it's a new/custom category
+            if len(words) > 1:
+                period_str = " ".join(words[1:]).strip()
+            else:
+                period_str = "this month" # Default period
+        else: # Should not happen due to initial args_text check
+            await update.message.reply_text("Please specify a category.")
+            return
+            
+    if not target_category: # Should be caught by earlier checks, but as a safeguard
+        await update.message.reply_text("Could not determine the category. Please specify clearly.")
+        return
+
+    logger.info(f"Parsed /category request: Category='{target_category}', Period='{period_str}'")
+
+    start_timestamp_ms, end_timestamp_ms = parse_period_to_date_range(period_str, nlp_processor)
+    
+    display_period_start_dt = datetime.fromtimestamp(start_timestamp_ms/1000)
+    display_period_end_dt = datetime.fromtimestamp(end_timestamp_ms/1000)
+    
+    display_period = f"{display_period_start_dt.strftime('%b %d, %Y')} to {display_period_end_dt.strftime('%b %d, %Y')}"
+    if period_str:
+        if period_str.lower() == "this month":
+            display_period = f"This Month ({display_period_start_dt.strftime('%B %Y')})"
+        elif period_str.lower() == "last month":
+            display_period = f"Last Month ({display_period_start_dt.strftime('%B %Y')})"
+        elif display_period_start_dt.day == 1 and \
+             (lambda y, m: hasattr(calendar, 'monthrange') and display_period_end_dt.day == calendar.monthrange(y, m)[1])(display_period_end_dt.year, display_period_end_dt.month):
+            display_period = display_period_start_dt.strftime("%B %Y")
+
+    query_args = {
+        "telegramChatId": telegram_chat_id,
+        "startDate": start_timestamp_ms,
+        "endDate": end_timestamp_ms,
+        "category": target_category.strip(), # Pass the determined category
+    }
+
+    await update.message.reply_text(f"Fetching summary for category '{target_category.strip()}' in {display_period}...")
+
+    try:
+        summary_result = convex_client.query("queries:getExpenseSummary", query_args)
+        
+        if summary_result:
+            count = summary_result.get("count", 0)
+            total_amount = summary_result.get("totalAmount", 0.0)
+            result_category = summary_result.get("category", target_category) # Use category from result if available
+            
+            response_message = f"📊 Expense Summary for Category: {result_category}\n"
+            response_message += f"Period: {display_period}\n"
+            response_message += f"Total Expenses: {count}\n"
+            response_message += f"Total Amount: ${total_amount:.2f}"
+
+            if count == 0:
+                response_message += "\n\nNo expenses found for this category in the specified period."
+
+            await update.message.reply_text(response_message)
+        else:
+            await update.message.reply_text("Could not retrieve summary. No data found or an error occurred.")
+
+    except Exception as e:
+        logger.error(f"Error calling Convex getExpenseSummary query for /category: {e}")
+        if "User not found" in str(e):
+            await update.message.reply_text("User not found. Please /start or /register first.")
+        else:
+            await update.message.reply_text(f"⚠️ An error occurred while fetching your category summary: {str(e)}")
 

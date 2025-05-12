@@ -16,7 +16,12 @@ from handlers.registration_handler import (
     USERNAME as REG_USERNAME,
     PASSWORD as REG_PASSWORD
 )
-from handlers.command_handler import log_command_v2, summary_command, details_command # Added details_command
+from handlers.command_handler import (
+    log_command_v2, 
+    summary_command, 
+    details_command,
+    category_command # Added category_command
+)
 
 # Load environment variables from .env.local file
 load_dotenv(dotenv_path=".env.local")
@@ -60,7 +65,7 @@ PREDEFINED_CATEGORIES: Dict[str, List[str]] = {
     "Travel": ["travel", "holiday", "vacation", "hotel", "accommodation", "trip"],
     "Miscellaneous": ["misc", "miscellaneous", "other"],
 }
-DEFAULT_CATEGORY = "Miscellaneous"
+DEFAULT_CATEGORY = "Miscellaneous" # Though not directly used by category_command, good to have defined
 
 # --- Main Application Setup ---
 def main() -> None:
@@ -85,15 +90,18 @@ def main() -> None:
         await log_command_v2(update, context, convex_client, nlp, PREDEFINED_CATEGORIES, DEFAULT_CATEGORY)
     async def wrapped_summary_command(update, context):
         await summary_command(update, context, convex_client, nlp)
-    async def wrapped_details_command(update, context): # New wrapper for /details
+    async def wrapped_details_command(update, context):
         await details_command(update, context, convex_client)
+    async def wrapped_category_command(update, context): # New wrapper for /category
+        await category_command(update, context, convex_client, nlp, PREDEFINED_CATEGORIES)
 
 
     application.add_handler(CommandHandler("log", wrapped_log_command))
     application.add_handler(CommandHandler("summary", wrapped_summary_command))
-    application.add_handler(CommandHandler("details", wrapped_details_command)) # Register /details
+    application.add_handler(CommandHandler("details", wrapped_details_command))
+    application.add_handler(CommandHandler("category", wrapped_category_command)) # Register /category
 
-    logger.info("Bot starting (refactored structure with /details)...")
+    logger.info("Bot starting (refactored structure with /category)...")
     application.run_polling()
 
 if __name__ == "__main__":
