@@ -2,7 +2,14 @@
 import logging
 import os
 from dotenv import load_dotenv
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler
+from telegram.ext import (
+    Application, 
+    CommandHandler, 
+    MessageHandler, 
+    filters, 
+    ConversationHandler,
+    CallbackQueryHandler # Added
+)
 from convex import ConvexClient
 import spacy
 from typing import Dict, List 
@@ -16,9 +23,9 @@ from handlers.registration_handler import (
     USERNAME as REG_USERNAME, 
     PASSWORD as REG_PASSWORD  
 )
-from handlers.log_handler import log_command_v2
+from handlers.log_handler import log_command_v2, handle_log_confirmation # Added handle_log_confirmation
 from handlers.query_handlers import summary_command, details_command, category_command
-from handlers.report_handler import report_command # Added report_command
+from handlers.report_handler import report_command
 
 # Load environment variables from .env.local file
 load_dotenv(dotenv_path=".env.local") 
@@ -64,6 +71,9 @@ PREDEFINED_CATEGORIES: Dict[str, List[str]] = {
 }
 DEFAULT_CATEGORY = "Miscellaneous"
 
+# Callback data prefixes (ensure these match what's in log_handler.py)
+LOG_CONFIRM_YES_PREFIX = "log_confirm_yes_"
+LOG_CONFIRM_NO_PREFIX = "log_confirm_no_"
 
 # --- Main Application Setup ---
 def main() -> None:
@@ -92,17 +102,25 @@ def main() -> None:
         await details_command(update, context, convex_client)
     async def wrapped_category_command(update, context):
         await category_command(update, context, convex_client, nlp, PREDEFINED_CATEGORIES)
-    async def wrapped_report_command(update, context): # New wrapper for /report
-        await report_command(update, context, convex_client, nlp) # nlp is needed for parse_period_to_date_range
-
+    async def wrapped_report_command(update, context):
+        await report_command(update, context, convex_client, nlp)
+    
+    # Wrapper for the log confirmation callback handler
+    async def wrapped_handle_log_confirmation(update, context):
+        await handle_log_confirmation(update, context, convex_client)
 
     application.add_handler(CommandHandler("log", wrapped_log_command))
     application.add_handler(CommandHandler("summary", wrapped_summary_command))
     application.add_handler(CommandHandler("details", wrapped_details_command))
     application.add_handler(CommandHandler("category", wrapped_category_command))
-    application.add_handler(CommandHandler("report", wrapped_report_command)) # Register /report
+    application.add_handler(CommandHandler("report", wrapped_report_command))
+    
+    # Add CallbackQueryHandler for log confirmations
+    # It will catch any callback data that starts with our defined prefixes
+    application.add_handler(CallbackQueryHandler(wrapped_handle_log_confirmation, pattern=f"^{LOG_CONFIRM_YES_PREFIX}|^^{LOG_CONFIRM_NO_PREFIX}"))
 
-    logger.info("Bot starting (refactored with /report command)...")
+
+    logger.info("Bot starting (with log confirmation)...")
     application.run_polling()
 
 if __name__ == "__main__":

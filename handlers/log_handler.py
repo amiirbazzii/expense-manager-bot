@@ -1,10 +1,11 @@
 # handlers/log_handler.py
 import logging
 import re
+import json # For serializing data in callback
 from datetime import datetime
-from typing import Optional
-from telegram import Update
-from telegram.ext import ContextTypes
+from typing import Optional, Dict, Any
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes, CallbackQueryHandler # Added CallbackQueryHandler
 
 # Assuming these are imported correctly in bot.py and passed here,
 # or imported from utils if they become more self-contained.
@@ -12,11 +13,21 @@ from utils.parsing_utils import parse_date_to_timestamp, determine_category
 
 logger = logging.getLogger(__name__)
 
+# Callback data prefixes for inline buttons
+LOG_CONFIRM_YES = "log_confirm_yes_"
+LOG_CONFIRM_NO = "log_confirm_no_"
+
 async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
                          convex_client: any, nlp_processor: any,
                          predefined_categories: dict, default_category: str) -> None:
     telegram_chat_id = str(update.message.from_user.id)
+    # Use context.args to get text after /log, handles cases where /log itself might be part of the text.
+    # However, the original split method is also fine if /log is always the command prefix.
+    # For consistency with other commands that use context.args, let's consider it,
+    # but the current split is okay if it works for all user inputs.
+    # For now, keeping the original split:
     full_text_after_log = update.message.text.split('/log', 1)[1].strip() if '/log' in update.message.text else ""
+
 
     if not full_text_after_log:
         await update.message.reply_text(
@@ -117,10 +128,10 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if amount_text_for_removal:
         logger.info(f"Attempting to remove amount text: '{amount_text_for_removal}'")
         removal_pattern_parts = []
-        if amount_text_for_removal[0].isalnum():
+        if amount_text_for_removal and amount_text_for_removal[0].isalnum():
             removal_pattern_parts.append(r'\b')
         removal_pattern_parts.append(re.escape(amount_text_for_removal))
-        if amount_text_for_removal[-1].isalnum():
+        if amount_text_for_removal and amount_text_for_removal[-1].isalnum():
             removal_pattern_parts.append(r'\b')
         removal_regex = "".join(removal_pattern_parts)
         
@@ -160,9 +171,9 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
         temp_desc = full_text_after_log
         if amount_text_for_removal:
             ar_parts = []
-            if amount_text_for_removal[0].isalnum(): ar_parts.append(r'\b')
+            if amount_text_for_removal and amount_text_for_removal[0].isalnum(): ar_parts.append(r'\b')
             ar_parts.append(re.escape(amount_text_for_removal))
-            if amount_text_for_removal[-1].isalnum(): ar_parts.append(r'\b')
+            if amount_text_for_removal and amount_text_for_removal[-1].isalnum(): ar_parts.append(r'\b')
             ar_regex = "".join(ar_parts)
             temp_desc = re.sub(ar_regex, '', temp_desc, 1, flags=re.IGNORECASE).strip()
 
@@ -188,32 +199,110 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not description:
         description = "Logged expense"
 
-    expense_data = {
-        "telegramChatId": telegram_chat_id,
-        "amount": amount,
-        "category": category,
-        "description": description,
-        "date": expense_timestamp,
+    # --- Store parsed data for confirmation ---
+    # We need a unique ID for this pending log to pass in callback_data
+    # For simplicity, we can use the message_id or a combination of chat_id and message_id
+    # A more robust way might be a UUID, but let's use message_id for now.
+    # Note: If multiple logs are initiated quickly, message_id might not be unique enough
+    # if the bot processes them slowly. For a personal bot, this risk is lower.
+    # A better way is to generate a unique ID and store the data against it.
+    # For now, let's serialize the whole expense_data into the callback_data if it's small enough.
+    # Telegram callback_data has a limit of 64 bytes. This is too small for all data.
+    # So, we must store it in context.chat_data or context.user_data.
+
+    pending_expense_data = {
+        "telegramChatId": telegram_chat_id, # Already string
+        "amount": amount, # float
+        "category": category, # string
+        "description": description.strip(), # string
+        "date": expense_timestamp, # int (timestamp)
     }
+    
+    # Store in chat_data, keyed by a unique identifier (e.g., message_id of the original /log command)
+    # This assumes one pending log per user at a time for simplicity.
+    # If multiple /log commands can be pending, need a more robust keying system.
+    # Let's use a simple key for now.
+    pending_log_key = f"pending_log_{update.message.message_id}"
+    context.chat_data[pending_log_key] = pending_expense_data
+    logger.info(f"Stored pending expense data with key: {pending_log_key}")
 
-    logger.info(f"Logging to Convex (log_handler): {expense_data}")
-    await update.message.reply_text(f"Trying to log: ${amount:.2f} for '{description}' in '{category}' on {datetime.fromtimestamp(expense_timestamp/1000).strftime('%Y-%m-%d')}...")
 
-    try:
-        result = convex_client.mutation("expenses:logExpense", expense_data)
-        if result and result.get("success"):
-            logged_date_obj = datetime.fromtimestamp(expense_timestamp / 1000)
-            await update.message.reply_text(
-                f"✅ Expense logged successfully!\n"
-                f"Amount: ${amount:.2f}\n"
-                f"Category: {expense_data['category']}\n"
-                f"Description: {expense_data['description']}\n"
-                f"Date: {logged_date_obj.strftime('%Y-%m-%d (%A)')}"
-            )
-        else:
-            error_msg = result.get("error", "Failed to log expense.") if result else "Failed to log expense (no response)."
-            await update.message.reply_text(f"⚠️ Error: {error_msg}")
-    except Exception as e:
-        logger.error(f"Error calling Convex logExpense mutation (log_handler): {e}")
-        await update.message.reply_text(f"⚠️ An error occurred while logging your expense: {str(e)}")
+    # --- Send Confirmation Message ---
+    confirmation_message = (
+        f"Please confirm this expense:\n\n"
+        f"💰 Amount: ${amount:.2f}\n"
+        f"🏷️ Category: {category}\n"
+        f"📝 Description: {description.strip()}\n"
+        f"🗓️ Date: {datetime.fromtimestamp(expense_timestamp/1000).strftime('%Y-%m-%d (%A)')}\n\n"
+        f"Is this correct?"
+    )
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, Log It!", callback_data=f"{LOG_CONFIRM_YES}{pending_log_key}"),
+            InlineKeyboardButton("❌ No, Cancel", callback_data=f"{LOG_CONFIRM_NO}{pending_log_key}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(confirmation_message, reply_markup=reply_markup)
+    logger.info(f"Sent confirmation message for key: {pending_log_key}")
+
+
+async def handle_log_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, convex_client: any) -> None:
+    """Handles the Yes/No callback from the log confirmation."""
+    query = update.callback_query
+    await query.answer() # Acknowledge the callback
+
+    callback_data_full = query.data
+    logger.info(f"Received log confirmation callback: {callback_data_full}")
+
+    pending_log_key = None
+    action = None
+
+    if callback_data_full.startswith(LOG_CONFIRM_YES):
+        action = "yes"
+        pending_log_key = callback_data_full[len(LOG_CONFIRM_YES):]
+    elif callback_data_full.startswith(LOG_CONFIRM_NO):
+        action = "no"
+        pending_log_key = callback_data_full[len(LOG_CONFIRM_NO):]
+
+    if not pending_log_key or pending_log_key not in context.chat_data:
+        logger.warning(f"Could not find pending log data for key: {pending_log_key} or key is None.")
+        await query.edit_message_text(text="Sorry, something went wrong or this request expired.")
+        return
+
+    expense_data: Optional[Dict[str, Any]] = context.chat_data.pop(pending_log_key, None) # Retrieve and remove
+
+    if not expense_data: # Should have been caught by the 'in' check, but good to be safe
+        logger.error(f"Expense data was None after pop for key: {pending_log_key}")
+        await query.edit_message_text(text="Error: Could not retrieve expense details.")
+        return
+
+    if action == "yes":
+        logger.info(f"User confirmed logging for key {pending_log_key}. Data: {expense_data}")
+        try:
+            result = convex_client.mutation("expenses:logExpense", expense_data) # expense_data is already prepared
+            if result and result.get("success"):
+                logged_date_obj = datetime.fromtimestamp(expense_data['date'] / 1000)
+                await query.edit_message_text(
+                    text=f"✅ Expense logged successfully!\n"
+                         f"Amount: ${expense_data['amount']:.2f}\n"
+                         f"Category: {expense_data['category']}\n"
+                         f"Description: {expense_data['description']}\n"
+                         f"Date: {logged_date_obj.strftime('%Y-%m-%d (%A)')}"
+                )
+            else:
+                error_msg = result.get("error", "Failed to log expense.") if result else "Failed to log expense (no response)."
+                await query.edit_message_text(text=f"⚠️ Error: {error_msg}")
+        except Exception as e:
+            logger.error(f"Error calling Convex logExpense mutation after confirmation: {e}")
+            await query.edit_message_text(text=f"⚠️ An error occurred while logging your expense: {str(e)}")
+    
+    elif action == "no":
+        logger.info(f"User cancelled logging for key {pending_log_key}.")
+        await query.edit_message_text(text="Logging cancelled. Feel free to try again with /log.")
+    else:
+        logger.warning(f"Unknown action in log confirmation callback: {callback_data_full}")
+        await query.edit_message_text(text="Sorry, I didn't understand that action.")
 
