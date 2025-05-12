@@ -1,9 +1,9 @@
 // convex/queries.ts
 import { v } from "convex/values";
 import { query } from "./_generated/server";
-import { Doc } from "./_generated/dataModel"; // Import Doc for typing expenses
+import { Doc } from "./_generated/dataModel";
 
-// getExpenseSummary query (should be here from previous step)
+// getExpenseSummary query (from previous steps)
 export const getExpenseSummary = query({
   args: {
     telegramChatId: v.string(),
@@ -15,7 +15,6 @@ export const getExpenseSummary = query({
     const user = await ctx.db
       .query("users")
       .withIndex("by_telegram_chat_id", (q) => q.eq("telegramChatId", args.telegramChatId))
-      .filter((q) => q.eq(q.field("telegramChatId"), args.telegramChatId))
       .unique();
 
     if (!user) {
@@ -29,7 +28,6 @@ export const getExpenseSummary = query({
          .gte("date", args.startDate)
          .lte("date", args.endDate)
       );
-      // .order("desc"); // Already in the previous version, good for consistency
 
     const expensesInRange = await expenseQuery.collect();
     
@@ -56,49 +54,84 @@ export const getExpenseSummary = query({
   },
 });
 
-// New query function for recent expenses
+// getRecentExpenses query (from previous steps)
 export const getRecentExpenses = query({
   args: {
     telegramChatId: v.string(),
-    limit: v.optional(v.number()), // Optional limit for number of expenses
+    limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    // 1. Find the user
     const user = await ctx.db
       .query("users")
       .withIndex("by_telegram_chat_id", (q) => q.eq("telegramChatId", args.telegramChatId))
-      .filter((q) => q.eq(q.field("telegramChatId"), args.telegramChatId))
       .unique();
 
     if (!user) {
       throw new Error("User not found. Please /start or /register first.");
     }
 
-    // 2. Determine the limit
-    const limit = args.limit ?? 5; // Default to 5 if no limit is provided
-    if (limit <= 0 || limit > 50) { // Add some reasonable bounds for the limit
+    const limit = args.limit ?? 5;
+    if (limit <= 0 || limit > 50) {
         throw new Error("Limit must be between 1 and 50.");
     }
 
-    // 3. Query expenses, order by date descending (most recent first), and apply limit
     const recentExpenses: Doc<"expenses">[] = await ctx.db
       .query("expenses")
-      .withIndex("by_userId_date", (q) => q.eq("userId", user._id)) // Filter by user
-      .order("desc") // Order by the 'date' field implicitly (most recent first due to how by_userId_date index is likely structured or by default _creationTime if date isn't the first sort field in index)
-                     // To be explicit for 'date' field from schema: .order("desc", "date") if 'date' is an indexed field suitable for primary sort.
-                     // Convex orders by index fields. If "by_userId_date" is ["userId", "date"], then .order("desc") on this query will sort by date descending for that user.
-      .take(limit); // Take the top 'limit' expenses
+      .withIndex("by_userId_date", (q) => q.eq("userId", user._id))
+      .order("desc")
+      .take(limit);
 
-    // 4. Return the expenses (or a subset of fields if needed)
-    // We are returning full documents, which is fine for this case.
     return recentExpenses.map(expense => ({
-        // Optionally, transform the data here if needed, e.g., formatting date
-        // For now, return essential fields.
-        _id: expense._id,
+        _id: expense._id.toString(), // Ensure ID is string for CSV if needed
         amount: expense.amount,
         category: expense.category,
         description: expense.description,
-        date: expense.date, // This is a timestamp
+        date: expense.date,
+    }));
+  },
+});
+
+// New query function for fetching all expenses for a report
+export const getExpensesForReport = query({
+  args: {
+    telegramChatId: v.string(),
+    startDate: v.number(), // Start timestamp (milliseconds)
+    endDate: v.number(),   // End timestamp (milliseconds)
+    // Optional: category could be added here too if needed for CSV reports
+    // category: v.optional(v.string()), 
+  },
+  handler: async (ctx, args) => {
+    // 1. Find the user
+    const user = await ctx.db
+      .query("users")
+      .withIndex("by_telegram_chat_id", (q) => q.eq("telegramChatId", args.telegramChatId))
+      .unique();
+
+    if (!user) {
+      throw new Error("User not found. Please /start or /register first.");
+    }
+
+    // 2. Query expenses within the date range for the user
+    // Using the by_userId_date index for efficient filtering.
+    // Order by date ascending for the report.
+    const expensesToReport: Doc<"expenses">[] = await ctx.db
+      .query("expenses")
+      .withIndex("by_userId_date", (q) => 
+        q.eq("userId", user._id)
+         .gte("date", args.startDate)
+         .lte("date", args.endDate)
+      )
+      .order("asc") // Order by date ascending for chronological report
+      .collect();
+
+    // 3. Return the expenses, potentially transforming fields for CSV friendliness
+    return expensesToReport.map(expense => ({
+        // Convert Convex Id to string if it's not already for easier CSV handling
+        // _id: expense._id.toString(), 
+        date: expense.date, // Keep as timestamp, will be formatted in Python
+        category: expense.category,
+        amount: expense.amount,
+        description: expense.description ?? "", // Ensure description is a string, not null
     }));
   },
 });
