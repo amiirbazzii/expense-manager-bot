@@ -1,84 +1,101 @@
 # handlers/log_handler.py
 import logging
 import re
-import json # For serializing data in callback
+import json 
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes, CallbackQueryHandler # Added CallbackQueryHandler
+from telegram.ext import ContextTypes, CallbackQueryHandler 
+import requests 
 
-# Assuming these are imported correctly in bot.py and passed here,
-# or imported from utils if they become more self-contained.
-from utils.parsing_utils import parse_date_to_timestamp, determine_category
+from utils.parsing_utils import parse_date_to_timestamp 
 
 logger = logging.getLogger(__name__)
 
-# Callback data prefixes for inline buttons
-LOG_CONFIRM_YES = "log_confirm_yes_"
-LOG_CONFIRM_NO = "log_confirm_no_"
+# Callback data prefixes
+LOG_CONFIRM_YES_PREFIX = "log_confirm_yes_" 
+LOG_CONFIRM_NO_PREFIX = "log_confirm_no_"   
+CAT_OVERRIDE_PREFIX = "cat_override_"       
+CAT_CANCEL_LOG_PREFIX = "cat_cancel_log_"  
 
+CATEGORY_CONFIDENCE_THRESHOLD = 0.60 
+
+# --- Helper to call AI Service ---
+def get_ai_category_prediction(text_to_predict: str, ai_service_url: str) -> Tuple[Optional[str], Optional[float]]:
+    """Calls the external AI service to get a category prediction."""
+    if not text_to_predict.strip(): 
+        logger.warning("Text for AI prediction is empty. Returning None.")
+        return None, 0.0 
+
+    endpoint = f"{ai_service_url.rstrip('/')}/predict_category"
+    payload = {"text": text_to_predict}
+    try:
+        logger.info(f"Calling AI service at {endpoint} with payload: {payload}")
+        response = requests.post(endpoint, json=payload, timeout=10) 
+        response.raise_for_status() 
+        
+        data = response.json()
+        predicted_category = data.get("predicted_category")
+        confidence = data.get("confidence")
+        logger.info(f"AI Service Response: Category='{predicted_category}', Confidence={confidence}")
+        return predicted_category, confidence
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error calling AI service at {endpoint}: {e}")
+        return None, None 
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding JSON response from AI service: {e}. Response text: {response.text if 'response' in locals() else 'N/A'}")
+        return None, None
+    except Exception as e: 
+        logger.error(f"Unexpected error during AI service call: {e}")
+        return None, None
+
+
+# --- Main Log Command (v2 - now with AI) ---
 async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
                          convex_client: any, nlp_processor: any,
-                         predefined_categories: dict, default_category: str) -> None:
+                         predefined_categories_for_buttons: dict, 
+                         default_category_fallback: str, 
+                         ai_service_url: str) -> None: 
     telegram_chat_id = str(update.message.from_user.id)
-    # Use context.args to get text after /log, handles cases where /log itself might be part of the text.
-    # However, the original split method is also fine if /log is always the command prefix.
-    # For consistency with other commands that use context.args, let's consider it,
-    # but the current split is okay if it works for all user inputs.
-    # For now, keeping the original split:
     full_text_after_log = update.message.text.split('/log', 1)[1].strip() if '/log' in update.message.text else ""
 
-
     if not full_text_after_log:
-        await update.message.reply_text(
-            "Please provide expense details after /log.\n"
-            "Example: /log $20 for lunch at the new cafe yesterday"
-        )
+        await update.message.reply_text("Please provide expense details after /log...")
         return
 
-    logger.info(f"User {telegram_chat_id} sent /log command with text: '{full_text_after_log}'")
+    logger.info(f"User {telegram_chat_id} /log: '{full_text_after_log}'")
     doc = nlp_processor(full_text_after_log)
     
-    logger.info(f"--- Amount Extraction for: '{full_text_after_log}' ---")
-    logger.info(f"spaCy Entities: {[(ent.text, ent.label_, ent.start_char, ent.end_char) for ent in doc.ents]}")
-
     amount: Optional[float] = None
-    amount_text_for_removal = ""
-
+    amount_text_for_removal = "" 
+    
     for ent in doc.ents:
         if ent.label_ == "MONEY":
-            logger.info(f"Processing MONEY entity: '{ent.text}' (start: {ent.start_char}, end: {ent.end_char})")
             try:
                 cleaned_entity_text = ent.text.replace("$", "").replace("€", "").replace("£", "").replace(",", "").strip()
                 parsed_val = float(cleaned_entity_text)
                 if parsed_val > 0:
                     amount = parsed_val
-                    potential_removal_text = ent.text
+                    potential_removal_text = ent.text 
                     entity_start_char = ent.start_char
-                    if not any(c in potential_removal_text for c in "$€£"):
+                    if not any(c in potential_removal_text for c in "$€£"): 
                         if entity_start_char > 0 and full_text_after_log[entity_start_char - 1] in "$€£":
                             potential_removal_text = full_text_after_log[entity_start_char - 1] + potential_removal_text
                         elif entity_start_char > 1 and full_text_after_log[entity_start_char - 2] in "$€£" and full_text_after_log[entity_start_char - 1].isspace():
                             potential_removal_text = full_text_after_log[entity_start_char - 2:entity_start_char] + potential_removal_text
                     amount_text_for_removal = potential_removal_text
-                    logger.info(f"Found amount from MONEY entity: {amount}, text for removal: '{amount_text_for_removal}'")
-                    break
-            except ValueError:
-                logger.warning(f"Could not convert MONEY entity text '{ent.text}' (cleaned: '{cleaned_entity_text}') to float.")
+                    logger.info(f"Amount from MONEY: {amount}, Text for removal: '{amount_text_for_removal}'")
+                    break 
+            except ValueError: pass
     
     if amount is None:
-        logger.info("No MONEY entity parsed, trying CARDINAL.")
         for ent in doc.ents:
             if ent.label_ == "CARDINAL":
-                logger.info(f"Processing CARDINAL entity: '{ent.text}' (start: {ent.start_char}, end: {ent.end_char})")
-                is_part_of_date = False
-                for date_ent in doc.ents:
-                    if date_ent.label_ == "DATE" and ent.start_char >= date_ent.start_char and ent.end_char <= date_ent.end_char:
-                        is_part_of_date = True
-                        break
-                logger.info(f"CARDINAL '{ent.text}' is_part_of_date: {is_part_of_date}")
-                if is_part_of_date:
-                    continue
+                is_part_of_date = any(
+                    date_ent.label_ == "DATE" and ent.start_char >= date_ent.start_char and ent.end_char <= date_ent.end_char
+                    for date_ent in doc.ents
+                )
+                if is_part_of_date: continue
                 try:
                     cleaned_cardinal_str = ent.text.replace(",", "").strip()
                     parsed_val = float(cleaned_cardinal_str)
@@ -86,223 +103,300 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         amount = parsed_val
                         potential_removal_text = ent.text
                         entity_start_char = ent.start_char
-                        if not any(c in potential_removal_text for c in "$€£"):
-                            if entity_start_char > 0 and full_text_after_log[entity_start_char - 1] in "$€£":
-                                potential_removal_text = full_text_after_log[entity_start_char - 1] + potential_removal_text
-                            elif entity_start_char > 1 and full_text_after_log[entity_start_char - 2] in "$€£" and full_text_after_log[entity_start_char - 1].isspace():
-                                potential_removal_text = full_text_after_log[entity_start_char - 2:entity_start_char] + potential_removal_text
+                        if entity_start_char > 0 and full_text_after_log[entity_start_char - 1] in "$€£":
+                            potential_removal_text = full_text_after_log[entity_start_char - 1] + potential_removal_text
+                        elif entity_start_char > 1 and full_text_after_log[entity_start_char - 2] in "$€£" and full_text_after_log[entity_start_char - 1].isspace():
+                             potential_removal_text = full_text_after_log[entity_start_char - 2:entity_start_char] + potential_removal_text
                         amount_text_for_removal = potential_removal_text
-                        logger.info(f"Found amount from CARDINAL entity: {amount}, text for removal: '{amount_text_for_removal}'")
+                        logger.info(f"Amount from CARDINAL: {amount}, Text for removal: '{amount_text_for_removal}'")
                         break
-                except ValueError:
-                    logger.warning(f"Could not convert CARDINAL entity '{ent.text}' to float.")
+                except ValueError: pass
 
-    if amount is None:
-        logger.info("No amount from spaCy MONEY/CARDINAL entities, trying regex fallback.")
+    if amount is None: 
         money_match = re.search(r"([\$€£]?)\s*(\d+(?:[\.,]\d+)?(?:\d+)?)", full_text_after_log)
         if money_match:
-            logger.info(f"Regex fallback matched: '{money_match.group(0)}'")
             try:
                 number_part = money_match.group(2)
                 cleaned_amount_str = number_part.replace(",", "").strip()
-                parsed_val = float(cleaned_amount_str)
-                if parsed_val > 0:
-                    amount = parsed_val
-                    amount_text_for_removal = money_match.group(0).strip()
-                    logger.info(f"Found amount from regex: {amount}, text for removal: '{amount_text_for_removal}'")
-            except ValueError:
-                logger.warning(f"Could not convert regex-found amount '{money_match.group(0)}' to float.")
+                amount = float(cleaned_amount_str)
+                amount_text_for_removal = money_match.group(0).strip() 
+                logger.info(f"Amount from REGEX: {amount}, Text for removal: '{amount_text_for_removal}'")
+            except ValueError: pass
 
     if amount is None or amount <= 0:
-        logger.error(f"Final amount is None or not positive: {amount}. Input was: '{full_text_after_log}'")
-        await update.message.reply_text("Could not determine a valid positive amount. Please include it clearly (e.g., $10.50 or 10.50).")
+        await update.message.reply_text("Could not determine a valid positive amount.")
         return
-    
-    logger.info(f"--- End Amount Extraction: Amount={amount}, TextForRemoval='{amount_text_for_removal}' ---")
 
     expense_timestamp = parse_date_to_timestamp(None, full_text_after_log, nlp_processor)
 
-    text_for_category_desc = full_text_after_log
-    logger.info(f"Initial text for cat/desc: '{text_for_category_desc}'")
+    text_for_ai = full_text_after_log
+    logger.info(f"Initial text for AI/description: '{text_for_ai}'")
 
     if amount_text_for_removal:
         logger.info(f"Attempting to remove amount text: '{amount_text_for_removal}'")
-        removal_pattern_parts = []
-        if amount_text_for_removal and amount_text_for_removal[0].isalnum():
-            removal_pattern_parts.append(r'\b')
-        removal_pattern_parts.append(re.escape(amount_text_for_removal))
-        if amount_text_for_removal and amount_text_for_removal[-1].isalnum():
-            removal_pattern_parts.append(r'\b')
-        removal_regex = "".join(removal_pattern_parts)
-        
-        text_for_category_desc = re.sub(removal_regex, '', text_for_category_desc, 1, flags=re.IGNORECASE).strip()
-        text_for_category_desc = re.sub(r'\s+', ' ', text_for_category_desc).strip()
-        logger.info(f"Text after amount removal: '{text_for_category_desc}'")
-
+        escaped_removal_text = re.escape(amount_text_for_removal)
+        text_for_ai = re.sub(escaped_removal_text, '', text_for_ai, 1, flags=re.IGNORECASE)
+        text_for_ai = re.sub(r'\s+', ' ', text_for_ai).strip() 
+        logger.info(f"Text after amount removal: '{text_for_ai}'")
+    
     date_entity_texts = [ent.text for ent in doc.ents if ent.label_ == "DATE"]
     for date_txt in date_entity_texts:
         logger.info(f"Attempting to remove date text: '{date_txt}'")
-        removal_pattern_parts = []
-        if date_txt and date_txt[0].isalnum(): removal_pattern_parts.append(r'\b')
-        removal_pattern_parts.append(re.escape(date_txt))
-        if date_txt and date_txt[-1].isalnum(): removal_pattern_parts.append(r'\b')
-        date_removal_regex = "".join(removal_pattern_parts)
-
-        text_for_category_desc = re.sub(date_removal_regex, '', text_for_category_desc, 1, flags=re.IGNORECASE).strip()
-        text_for_category_desc = re.sub(r'\s+', ' ', text_for_category_desc).strip()
-        logger.info(f"Text after removing '{date_txt}': '{text_for_category_desc}'")
-
-    text_for_category_desc = re.sub(r'^(on|for|at|spent|buy|bought|get|got)\s+', '', text_for_category_desc, flags=re.IGNORECASE).strip()
-    text_for_category_desc = re.sub(r'\s+(on|for|at)$', '', text_for_category_desc, flags=re.IGNORECASE).strip()
-    text_for_category_desc = re.sub(r'\s+', ' ', text_for_category_desc).strip()
-    logger.info(f"Text after preposition cleanup: '{text_for_category_desc}'")
-
-    category = determine_category(text_for_category_desc if text_for_category_desc else full_text_after_log, 
-                                  nlp_processor, predefined_categories, default_category)
+        escaped_date = re.escape(date_txt)
+        text_for_ai = re.sub(r'\b' + escaped_date + r'\b', '', text_for_ai, 1, flags=re.IGNORECASE)
+        text_for_ai = re.sub(r'\s+', ' ', text_for_ai).strip()
+        logger.info(f"Text after removing '{date_txt}': '{text_for_ai}'")
     
-    description = text_for_category_desc if text_for_category_desc.strip() else "N/A"
-
-    if category != default_category and category.lower() in description.lower():
-        description = description.lower().replace(category.lower(), "", 1).strip()
-        description = re.sub(r'^(on|for|at)\s+', '', description, flags=re.IGNORECASE).strip()
-        description = description.capitalize() if description.strip() else "N/A"
+    text_for_ai = re.sub(r'^(on|for|at|spent|buy|bought|get|got|paid)\s+', '', text_for_ai, flags=re.IGNORECASE).strip()
+    text_for_ai = re.sub(r'\s+(on|for|at)$', '', text_for_ai, flags=re.IGNORECASE).strip()
+    text_for_ai = re.sub(r'\s+', ' ', text_for_ai).strip() 
+    logger.info(f"Text after keyword/preposition cleanup: '{text_for_ai}'")
     
-    if not description.strip() or len(description.strip()) < 2 :
-        temp_desc = full_text_after_log
-        if amount_text_for_removal:
-            ar_parts = []
-            if amount_text_for_removal and amount_text_for_removal[0].isalnum(): ar_parts.append(r'\b')
-            ar_parts.append(re.escape(amount_text_for_removal))
-            if amount_text_for_removal and amount_text_for_removal[-1].isalnum(): ar_parts.append(r'\b')
-            ar_regex = "".join(ar_parts)
-            temp_desc = re.sub(ar_regex, '', temp_desc, 1, flags=re.IGNORECASE).strip()
+    description_candidate = text_for_ai if text_for_ai else "N/A"
+    if len(description_candidate) > 100: description_candidate = description_candidate[:97] + "..."
 
-        for date_txt in date_entity_texts:
-            dr_parts = []
-            if date_txt and date_txt[0].isalnum(): dr_parts.append(r'\b')
-            dr_parts.append(re.escape(date_txt))
-            if date_txt and date_txt[-1].isalnum(): dr_parts.append(r'\b')
-            dr_regex = "".join(dr_parts)
-            temp_desc = re.sub(dr_regex, '', temp_desc, 1, flags=re.IGNORECASE).strip()
-        
-        temp_desc = re.sub(r'\s+', ' ', temp_desc).strip()
-        temp_desc = re.sub(r'^(on|for|at|spent|buy|bought|get|got)\s+', '', temp_desc, flags=re.IGNORECASE).strip()
-        
-        if temp_desc and len(temp_desc.strip()) > 2:
-            description = temp_desc[:75].strip() + ("..." if len(temp_desc) > 75 else "")
-        elif category != default_category :
-            description = category 
-        else:
-            description = "Logged expense"
-    
-    description = description.strip()
-    if not description:
-        description = "Logged expense"
+    ai_predicted_category, ai_confidence = get_ai_category_prediction(description_candidate, ai_service_url)
 
-    # --- Store parsed data for confirmation ---
-    # We need a unique ID for this pending log to pass in callback_data
-    # For simplicity, we can use the message_id or a combination of chat_id and message_id
-    # A more robust way might be a UUID, but let's use message_id for now.
-    # Note: If multiple logs are initiated quickly, message_id might not be unique enough
-    # if the bot processes them slowly. For a personal bot, this risk is lower.
-    # A better way is to generate a unique ID and store the data against it.
-    # For now, let's serialize the whole expense_data into the callback_data if it's small enough.
-    # Telegram callback_data has a limit of 64 bytes. This is too small for all data.
-    # So, we must store it in context.chat_data or context.user_data.
+    final_category = default_category_fallback 
+    if ai_predicted_category:
+        final_category = ai_predicted_category
+    else: 
+        logger.warning("AI service did not return a category. Using default fallback.")
+        ai_confidence = 0.0 
 
-    pending_expense_data = {
-        "telegramChatId": telegram_chat_id, # Already string
-        "amount": amount, # float
-        "category": category, # string
-        "description": description.strip(), # string
-        "date": expense_timestamp, # int (timestamp)
+    parsed_expense_details = {
+        "telegramChatId": telegram_chat_id,
+        "amount": amount,
+        "category": final_category, 
+        "description": description_candidate, 
+        "date": expense_timestamp,
+        "ai_suggested_category": ai_predicted_category, 
+        "ai_confidence": ai_confidence
     }
     
-    # Store in chat_data, keyed by a unique identifier (e.g., message_id of the original /log command)
-    # This assumes one pending log per user at a time for simplicity.
-    # If multiple /log commands can be pending, need a more robust keying system.
-    # Let's use a simple key for now.
-    pending_log_key = f"pending_log_{update.message.message_id}"
-    context.chat_data[pending_log_key] = pending_expense_data
-    logger.info(f"Stored pending expense data with key: {pending_log_key}")
+    log_attempt_key = f"log_attempt_{update.message.message_id}"
+    context.chat_data[log_attempt_key] = parsed_expense_details
+    logger.info(f"Stored initial parsed expense data with key: {log_attempt_key}. Data: {parsed_expense_details}")
+
+    # Corrected f-string for logging AI confidence
+    confidence_log_str = f"{ai_confidence * 100:.0f}%" if ai_confidence is not None else "N/A"
+    if ai_confidence is not None and ai_confidence >= CATEGORY_CONFIDENCE_THRESHOLD:
+        logger.info(f"AI confidence ({confidence_log_str}) is high. Proceeding to final confirmation.")
+        await send_final_log_confirmation(update, context, log_attempt_key, parsed_expense_details)
+    else:
+        logger.info(f"AI confidence ({confidence_log_str}) is low or AI failed. Asking user to confirm/select category.")
+        keyboard_buttons = []
+        ai_cat_str = str(ai_predicted_category) if ai_predicted_category is not None else ""
+
+        if ai_predicted_category:
+            keyboard_buttons.append(
+                InlineKeyboardButton(f"✅ Use '{ai_cat_str}'", callback_data=f"{CAT_OVERRIDE_PREFIX}{ai_cat_str}_{log_attempt_key}")
+            )
+        
+        suggestions_made = {ai_cat_str} if ai_predicted_category else set()
+        
+        if isinstance(predefined_categories_for_buttons, dict):
+            common_cats_for_buttons = [
+                cat for cat in ["Food & Drink", "Transport", "Shopping", "Utilities", default_category_fallback] 
+                if cat not in suggestions_made and cat in predefined_categories_for_buttons
+            ]
+            for cat_suggestion in common_cats_for_buttons[:3]: 
+                if cat_suggestion not in suggestions_made:
+                    keyboard_buttons.append(
+                        InlineKeyboardButton(f"{cat_suggestion}", callback_data=f"{CAT_OVERRIDE_PREFIX}{cat_suggestion}_{log_attempt_key}")
+                    )
+                    suggestions_made.add(cat_suggestion)
+        
+        default_cat_str = str(default_category_fallback)
+        if default_cat_str not in suggestions_made:
+             keyboard_buttons.append(
+                InlineKeyboardButton(f"{default_cat_str}", callback_data=f"{CAT_OVERRIDE_PREFIX}{default_cat_str}_{log_attempt_key}")
+            )
+
+        keyboard_layout = [keyboard_buttons[i:i + 2] for i in range(0, len(keyboard_buttons), 2)]
+        keyboard_layout.append([InlineKeyboardButton("❌ Cancel Log", callback_data=f"{CAT_CANCEL_LOG_PREFIX}{log_attempt_key}")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard_layout)
+        
+        # Corrected f-string for displaying AI confidence
+        confidence_display_str = f"{ai_confidence*100:.0f}%" if ai_confidence is not None else "N/A"
+        display_ai_suggestion = f"'{ai_cat_str}' (Confidence: {confidence_display_str})" if ai_predicted_category else "unavailable"
+        
+        message_text_desc_hint = description_candidate if description_candidate != "N/A" else text_for_ai 
+        if not message_text_desc_hint: message_text_desc_hint = "your input"
 
 
-    # --- Send Confirmation Message ---
+        message_text = (
+            f"🤖 My AI suggests category: {display_ai_suggestion}.\n"
+            f"For: '{message_text_desc_hint}'\n\n" 
+            f"Please confirm or choose a different category:"
+        )
+        if not ai_predicted_category: 
+             message_text = (
+                f"🤖 My AI couldn't determine a category for: '{message_text_desc_hint}'.\n"
+                f"Please choose a category:"
+            )
+        await update.message.reply_text(message_text, reply_markup=reply_markup)
+
+async def send_final_log_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                      log_attempt_key: str, 
+                                      expense_details: Dict[str, Any]):
+    logger.info(f"Sending final log confirmation for key {log_attempt_key}. Details: {expense_details}")
+    
+    amount = expense_details.get("amount")
+    category = expense_details.get("category")
+    description = expense_details.get("description")
+    expense_timestamp = expense_details.get("date")
+
+    if None in [amount, category, description, expense_timestamp]:
+        logger.error(f"Missing data in expense_details for final confirmation: {expense_details}")
+        target_message = update.callback_query.message if update.callback_query else update.message
+        if target_message:
+            try:
+                await target_message.edit_text("Error: Could not prepare expense details for final confirmation.")
+            except Exception: 
+                 await context.bot.send_message(chat_id=target_message.chat_id, text="Error: Could not prepare expense details for final confirmation.")
+        return
+
     confirmation_message = (
         f"Please confirm this expense:\n\n"
         f"💰 Amount: ${amount:.2f}\n"
         f"🏷️ Category: {category}\n"
-        f"📝 Description: {description.strip()}\n"
+        f"📝 Description: {description}\n" 
         f"🗓️ Date: {datetime.fromtimestamp(expense_timestamp/1000).strftime('%Y-%m-%d (%A)')}\n\n"
         f"Is this correct?"
     )
-    
     keyboard = [
         [
-            InlineKeyboardButton("✅ Yes, Log It!", callback_data=f"{LOG_CONFIRM_YES}{pending_log_key}"),
-            InlineKeyboardButton("❌ No, Cancel", callback_data=f"{LOG_CONFIRM_NO}{pending_log_key}")
+            InlineKeyboardButton("✅ Yes, Log It!", callback_data=f"{LOG_CONFIRM_YES_PREFIX}{log_attempt_key}"),
+            InlineKeyboardButton("❌ No, Cancel", callback_data=f"{LOG_CONFIRM_NO_PREFIX}{log_attempt_key}")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(confirmation_message, reply_markup=reply_markup)
-    logger.info(f"Sent confirmation message for key: {pending_log_key}")
+
+    if update.callback_query: 
+        await update.callback_query.edit_message_text(text=confirmation_message, reply_markup=reply_markup)
+    elif update.message: 
+        await update.message.reply_text(text=confirmation_message, reply_markup=reply_markup)
 
 
-async def handle_log_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, convex_client: any) -> None:
-    """Handles the Yes/No callback from the log confirmation."""
+async def handle_category_override_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, convex_client: any) -> None:
     query = update.callback_query
-    await query.answer() # Acknowledge the callback
-
+    await query.answer()
+    
     callback_data_full = query.data
-    logger.info(f"Received log confirmation callback: {callback_data_full}")
+    logger.info(f"Received category override callback: {callback_data_full}")
 
-    pending_log_key = None
-    action = None
+    chosen_category = None 
+    log_attempt_key = None 
 
-    if callback_data_full.startswith(LOG_CONFIRM_YES):
-        action = "yes"
-        pending_log_key = callback_data_full[len(LOG_CONFIRM_YES):]
-    elif callback_data_full.startswith(LOG_CONFIRM_NO):
-        action = "no"
-        pending_log_key = callback_data_full[len(LOG_CONFIRM_NO):]
+    if callback_data_full.startswith(CAT_OVERRIDE_PREFIX):
+        data_after_prefix = callback_data_full[len(CAT_OVERRIDE_PREFIX):]
+        key_marker_actual_start = "log_attempt_" 
+        idx_key_marker_separator = data_after_prefix.rfind(f"_{key_marker_actual_start}")
 
-    if not pending_log_key or pending_log_key not in context.chat_data:
-        logger.warning(f"Could not find pending log data for key: {pending_log_key} or key is None.")
+        if idx_key_marker_separator != -1:
+            chosen_category = data_after_prefix[:idx_key_marker_separator] 
+            log_attempt_key = data_after_prefix[idx_key_marker_separator+1:] 
+            logger.info(f"Parsed from CAT_OVERRIDE: chosen_category='{chosen_category}', log_attempt_key='{log_attempt_key}'")
+        else:
+            logger.error(f"Could not properly parse category and key from CAT_OVERRIDE_PREFIX data: {data_after_prefix}")
+            await query.edit_message_text("Error processing your selection (key parsing failed).")
+            return
+            
+    elif callback_data_full.startswith(CAT_CANCEL_LOG_PREFIX):
+        log_attempt_key = callback_data_full[len(CAT_CANCEL_LOG_PREFIX):]
+        if log_attempt_key in context.chat_data:
+            context.chat_data.pop(log_attempt_key, None) 
+        await query.edit_message_text("Logging cancelled as requested.")
+        logger.info(f"User cancelled logging during category selection for key {log_attempt_key}.")
+        return
+    else:
+        logger.warning(f"Unknown prefix in category override callback: {callback_data_full}")
+        await query.edit_message_text("Invalid selection.")
+        return
+
+    if not log_attempt_key or log_attempt_key not in context.chat_data:
+        logger.warning(f"Could not find pending log data for key: '{log_attempt_key}' in category override. chat_data keys: {list(context.chat_data.keys())}")
         await query.edit_message_text(text="Sorry, something went wrong or this request expired.")
         return
 
-    expense_data: Optional[Dict[str, Any]] = context.chat_data.pop(pending_log_key, None) # Retrieve and remove
+    pending_expense_details: Optional[Dict[str, Any]] = context.chat_data.get(log_attempt_key) 
 
-    if not expense_data: # Should have been caught by the 'in' check, but good to be safe
-        logger.error(f"Expense data was None after pop for key: {pending_log_key}")
+    if not pending_expense_details:
+        logger.error(f"Pending expense details None for key {log_attempt_key} in category override.")
         await query.edit_message_text(text="Error: Could not retrieve expense details.")
+        return
+    
+    if chosen_category is not None: 
+        logger.info(f"User selected category '{chosen_category}' for log attempt {log_attempt_key}.")
+        pending_expense_details["category"] = chosen_category 
+        await send_final_log_confirmation(update, context, log_attempt_key, pending_expense_details)
+    else: 
+        logger.error(f"Chosen category was None for log_attempt_key {log_attempt_key} after parsing callback data.")
+        await query.edit_message_text("Error: No category was effectively selected.")
+
+
+async def handle_log_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, convex_client: any) -> None:
+    query = update.callback_query
+    await query.answer() 
+
+    callback_data_full = query.data
+    logger.info(f"Received FINAL log confirmation callback: {callback_data_full}")
+
+    log_attempt_key = None
+    action = None
+
+    if callback_data_full.startswith(LOG_CONFIRM_YES_PREFIX):
+        action = "yes"
+        log_attempt_key = callback_data_full[len(LOG_CONFIRM_YES_PREFIX):]
+    elif callback_data_full.startswith(LOG_CONFIRM_NO_PREFIX):
+        action = "no"
+        log_attempt_key = callback_data_full[len(LOG_CONFIRM_NO_PREFIX):]
+
+    if not log_attempt_key or log_attempt_key not in context.chat_data:
+        logger.warning(f"Could not find final pending log data for key: '{log_attempt_key}'. chat_data keys: {list(context.chat_data.keys())}")
+        await query.edit_message_text(text="Sorry, something went wrong or this request expired.")
+        return
+
+    expense_data_to_log: Optional[Dict[str, Any]] = context.chat_data.pop(log_attempt_key, None) 
+
+    if not expense_data_to_log:
+        logger.error(f"Final expense data was None after pop for key: {log_attempt_key}")
+        await query.edit_message_text(text="Error: Could not retrieve expense details to log.")
         return
 
     if action == "yes":
-        logger.info(f"User confirmed logging for key {pending_log_key}. Data: {expense_data}")
+        logger.info(f"User confirmed FINAL logging for key {log_attempt_key}. Data: {expense_data_to_log}")
+        convex_payload = {
+            "telegramChatId": expense_data_to_log["telegramChatId"],
+            "amount": expense_data_to_log["amount"],
+            "category": expense_data_to_log["category"],
+            "description": expense_data_to_log["description"], 
+            "date": expense_data_to_log["date"],
+        }
         try:
-            result = convex_client.mutation("expenses:logExpense", expense_data) # expense_data is already prepared
+            result = convex_client.mutation("expenses:logExpense", convex_payload)
             if result and result.get("success"):
-                logged_date_obj = datetime.fromtimestamp(expense_data['date'] / 1000)
+                logged_date_obj = datetime.fromtimestamp(expense_data_to_log['date'] / 1000)
                 await query.edit_message_text(
                     text=f"✅ Expense logged successfully!\n"
-                         f"Amount: ${expense_data['amount']:.2f}\n"
-                         f"Category: {expense_data['category']}\n"
-                         f"Description: {expense_data['description']}\n"
+                         f"Amount: ${expense_data_to_log['amount']:.2f}\n"
+                         f"Category: {expense_data_to_log['category']}\n"
+                         f"Description: {expense_data_to_log['description']}\n"
                          f"Date: {logged_date_obj.strftime('%Y-%m-%d (%A)')}"
                 )
             else:
                 error_msg = result.get("error", "Failed to log expense.") if result else "Failed to log expense (no response)."
                 await query.edit_message_text(text=f"⚠️ Error: {error_msg}")
         except Exception as e:
-            logger.error(f"Error calling Convex logExpense mutation after confirmation: {e}")
+            logger.error(f"Error calling Convex logExpense mutation after final confirmation: {e}")
             await query.edit_message_text(text=f"⚠️ An error occurred while logging your expense: {str(e)}")
     
     elif action == "no":
-        logger.info(f"User cancelled logging for key {pending_log_key}.")
+        logger.info(f"User cancelled FINAL logging for key {log_attempt_key}.")
         await query.edit_message_text(text="Logging cancelled. Feel free to try again with /log.")
     else:
-        logger.warning(f"Unknown action in log confirmation callback: {callback_data_full}")
+        logger.warning(f"Unknown action in final log confirmation callback: {callback_data_full}")
         await query.edit_message_text(text="Sorry, I didn't understand that action.")
 
