@@ -1,18 +1,19 @@
 # handlers/log_handler.py
 import logging
-import re
-import json 
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, CallbackQueryHandler 
-import requests 
 
+# Local imports for refactored logic
+from services.ai_categorization_service import get_ai_category_prediction
+from utils.log_processing_utils import extract_amount_from_text, prepare_text_for_ai
+# Assuming parse_date_to_timestamp is still in the main parsing_utils
 from utils.parsing_utils import parse_date_to_timestamp 
 
 logger = logging.getLogger(__name__)
 
-# Callback data prefixes
+# Callback data prefixes (remain the same)
 LOG_CONFIRM_YES_PREFIX = "log_confirm_yes_" 
 LOG_CONFIRM_NO_PREFIX = "log_confirm_no_"   
 CAT_OVERRIDE_PREFIX = "cat_override_"       
@@ -20,39 +21,8 @@ CAT_CANCEL_LOG_PREFIX = "cat_cancel_log_"
 
 CATEGORY_CONFIDENCE_THRESHOLD = 0.60 
 
-# --- Helper to call AI Service ---
-def get_ai_category_prediction(text_to_predict: str, ai_service_url: str) -> Tuple[Optional[str], Optional[float]]:
-    """Calls the external AI service to get a category prediction."""
-    if not text_to_predict.strip(): 
-        logger.warning("Text for AI prediction is empty. Returning None.")
-        return None, 0.0 
-
-    endpoint = f"{ai_service_url.rstrip('/')}/predict_category"
-    payload = {"text": text_to_predict}
-    try:
-        logger.info(f"Calling AI service at {endpoint} with payload: {payload}")
-        response = requests.post(endpoint, json=payload, timeout=10) 
-        response.raise_for_status() 
-        
-        data = response.json()
-        predicted_category = data.get("predicted_category")
-        confidence = data.get("confidence")
-        logger.info(f"AI Service Response: Category='{predicted_category}', Confidence={confidence}")
-        return predicted_category, confidence
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error calling AI service at {endpoint}: {e}")
-        return None, None 
-    except json.JSONDecodeError as e:
-        logger.error(f"Error decoding JSON response from AI service: {e}. Response text: {response.text if 'response' in locals() else 'N/A'}")
-        return None, None
-    except Exception as e: 
-        logger.error(f"Unexpected error during AI service call: {e}")
-        return None, None
-
-
-# --- Main Log Command (v2 - now with AI) ---
 async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                         convex_client: any, nlp_processor: any,
+                         convex_client: any, nlp_processor: any, # nlp_processor is spaCy's nlp object
                          predefined_categories_for_buttons: dict, 
                          default_category_fallback: str, 
                          ai_service_url: str) -> None: 
@@ -63,112 +33,44 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text("Please provide expense details after /log...")
         return
 
-    logger.info(f"User {telegram_chat_id} /log: '{full_text_after_log}'")
-    doc = nlp_processor(full_text_after_log)
+    logger.info(f"User {telegram_chat_id} /log (refactored): '{full_text_after_log}'")
+    doc = nlp_processor(full_text_after_log) # Process with spaCy once
     
-    amount: Optional[float] = None
-    amount_text_for_removal = "" 
-    
-    for ent in doc.ents:
-        if ent.label_ == "MONEY":
-            try:
-                cleaned_entity_text = ent.text.replace("$", "").replace("€", "").replace("£", "").replace(",", "").strip()
-                parsed_val = float(cleaned_entity_text)
-                if parsed_val > 0:
-                    amount = parsed_val
-                    potential_removal_text = ent.text 
-                    entity_start_char = ent.start_char
-                    if not any(c in potential_removal_text for c in "$€£"): 
-                        if entity_start_char > 0 and full_text_after_log[entity_start_char - 1] in "$€£":
-                            potential_removal_text = full_text_after_log[entity_start_char - 1] + potential_removal_text
-                        elif entity_start_char > 1 and full_text_after_log[entity_start_char - 2] in "$€£" and full_text_after_log[entity_start_char - 1].isspace():
-                            potential_removal_text = full_text_after_log[entity_start_char - 2:entity_start_char] + potential_removal_text
-                    amount_text_for_removal = potential_removal_text
-                    logger.info(f"Amount from MONEY: {amount}, Text for removal: '{amount_text_for_removal}'")
-                    break 
-            except ValueError: pass
-    
-    if amount is None:
-        for ent in doc.ents:
-            if ent.label_ == "CARDINAL":
-                is_part_of_date = any(
-                    date_ent.label_ == "DATE" and ent.start_char >= date_ent.start_char and ent.end_char <= date_ent.end_char
-                    for date_ent in doc.ents
-                )
-                if is_part_of_date: continue
-                try:
-                    cleaned_cardinal_str = ent.text.replace(",", "").strip()
-                    parsed_val = float(cleaned_cardinal_str)
-                    if parsed_val > 0:
-                        amount = parsed_val
-                        potential_removal_text = ent.text
-                        entity_start_char = ent.start_char
-                        if entity_start_char > 0 and full_text_after_log[entity_start_char - 1] in "$€£":
-                            potential_removal_text = full_text_after_log[entity_start_char - 1] + potential_removal_text
-                        elif entity_start_char > 1 and full_text_after_log[entity_start_char - 2] in "$€£" and full_text_after_log[entity_start_char - 1].isspace():
-                             potential_removal_text = full_text_after_log[entity_start_char - 2:entity_start_char] + potential_removal_text
-                        amount_text_for_removal = potential_removal_text
-                        logger.info(f"Amount from CARDINAL: {amount}, Text for removal: '{amount_text_for_removal}'")
-                        break
-                except ValueError: pass
-
-    if amount is None: 
-        money_match = re.search(r"([\$€£]?)\s*(\d+(?:[\.,]\d+)?(?:\d+)?)", full_text_after_log)
-        if money_match:
-            try:
-                number_part = money_match.group(2)
-                cleaned_amount_str = number_part.replace(",", "").strip()
-                amount = float(cleaned_amount_str)
-                amount_text_for_removal = money_match.group(0).strip() 
-                logger.info(f"Amount from REGEX: {amount}, Text for removal: '{amount_text_for_removal}'")
-            except ValueError: pass
+    # --- Use new utility functions for parsing ---
+    amount, amount_text_for_removal = extract_amount_from_text(full_text_after_log, doc)
 
     if amount is None or amount <= 0:
         await update.message.reply_text("Could not determine a valid positive amount.")
         return
 
     expense_timestamp = parse_date_to_timestamp(None, full_text_after_log, nlp_processor)
-
-    text_for_ai = full_text_after_log
-    logger.info(f"Initial text for AI/description: '{text_for_ai}'")
-
-    if amount_text_for_removal:
-        logger.info(f"Attempting to remove amount text: '{amount_text_for_removal}'")
-        escaped_removal_text = re.escape(amount_text_for_removal)
-        text_for_ai = re.sub(escaped_removal_text, '', text_for_ai, 1, flags=re.IGNORECASE)
-        text_for_ai = re.sub(r'\s+', ' ', text_for_ai).strip() 
-        logger.info(f"Text after amount removal: '{text_for_ai}'")
     
-    date_entity_texts = [ent.text for ent in doc.ents if ent.label_ == "DATE"]
-    for date_txt in date_entity_texts:
-        logger.info(f"Attempting to remove date text: '{date_txt}'")
-        escaped_date = re.escape(date_txt)
-        text_for_ai = re.sub(r'\b' + escaped_date + r'\b', '', text_for_ai, 1, flags=re.IGNORECASE)
-        text_for_ai = re.sub(r'\s+', ' ', text_for_ai).strip()
-        logger.info(f"Text after removing '{date_txt}': '{text_for_ai}'")
+    description_for_ai = prepare_text_for_ai(full_text_after_log, doc, amount_text_for_removal)
     
-    text_for_ai = re.sub(r'^(on|for|at|spent|buy|bought|get|got|paid)\s+', '', text_for_ai, flags=re.IGNORECASE).strip()
-    text_for_ai = re.sub(r'\s+(on|for|at)$', '', text_for_ai, flags=re.IGNORECASE).strip()
-    text_for_ai = re.sub(r'\s+', ' ', text_for_ai).strip() 
-    logger.info(f"Text after keyword/preposition cleanup: '{text_for_ai}'")
-    
-    description_candidate = text_for_ai if text_for_ai else "N/A"
-    if len(description_candidate) > 100: description_candidate = description_candidate[:97] + "..."
+    # Truncate if too long for display or AI service (if it has limits)
+    description_candidate = description_for_ai
+    if len(description_candidate) > 100: 
+        description_candidate = description_candidate[:97] + "..."
+    if not description_candidate.strip(): # If cleaning resulted in empty string
+        description_candidate = "N/A"
 
-    ai_predicted_category, ai_confidence = get_ai_category_prediction(description_candidate, ai_service_url)
+
+    # --- Call AI Service (from new service module) ---
+    ai_predicted_category, ai_confidence = get_ai_category_prediction(description_for_ai, ai_service_url)
 
     final_category = default_category_fallback 
     if ai_predicted_category:
         final_category = ai_predicted_category
     else: 
         logger.warning("AI service did not return a category. Using default fallback.")
-        ai_confidence = 0.0 
+        ai_confidence = 0.0 # Treat as very low confidence
 
+    # --- Prepare data for confirmation (either direct or after category override) ---
     parsed_expense_details = {
         "telegramChatId": telegram_chat_id,
         "amount": amount,
         "category": final_category, 
-        "description": description_candidate, 
+        "description": description_candidate, # Use the cleaned and potentially truncated version
         "date": expense_timestamp,
         "ai_suggested_category": ai_predicted_category, 
         "ai_confidence": ai_confidence
@@ -178,7 +80,7 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
     context.chat_data[log_attempt_key] = parsed_expense_details
     logger.info(f"Stored initial parsed expense data with key: {log_attempt_key}. Data: {parsed_expense_details}")
 
-    # Corrected f-string for logging AI confidence
+    # --- Confidence Check & User Interaction (logic remains similar) ---
     confidence_log_str = f"{ai_confidence * 100:.0f}%" if ai_confidence is not None else "N/A"
     if ai_confidence is not None and ai_confidence >= CATEGORY_CONFIDENCE_THRESHOLD:
         logger.info(f"AI confidence ({confidence_log_str}) is high. Proceeding to final confirmation.")
@@ -218,13 +120,11 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
         
         reply_markup = InlineKeyboardMarkup(keyboard_layout)
         
-        # Corrected f-string for displaying AI confidence
         confidence_display_str = f"{ai_confidence*100:.0f}%" if ai_confidence is not None else "N/A"
         display_ai_suggestion = f"'{ai_cat_str}' (Confidence: {confidence_display_str})" if ai_predicted_category else "unavailable"
         
-        message_text_desc_hint = description_candidate if description_candidate != "N/A" else text_for_ai 
+        message_text_desc_hint = description_candidate if description_candidate != "N/A" else description_for_ai
         if not message_text_desc_hint: message_text_desc_hint = "your input"
-
 
         message_text = (
             f"🤖 My AI suggests category: {display_ai_suggestion}.\n"
@@ -237,6 +137,13 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 f"Please choose a category:"
             )
         await update.message.reply_text(message_text, reply_markup=reply_markup)
+
+# --- Callback Handlers (send_final_log_confirmation, handle_category_override_selection, handle_log_confirmation) ---
+# These functions remain largely the same as in the previous version of log_handler.py.
+# Ensure they are correctly defined here. For brevity, I'm not repeating their full code
+# if they don't have significant changes due to this specific refactor.
+# The key is that they operate on `parsed_expense_details` retrieved from `context.chat_data`
+# using `log_attempt_key`.
 
 async def send_final_log_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                                       log_attempt_key: str, 
@@ -399,4 +306,3 @@ async def handle_log_confirmation(update: Update, context: ContextTypes.DEFAULT_
     else:
         logger.warning(f"Unknown action in final log confirmation callback: {callback_data_full}")
         await query.edit_message_text(text="Sorry, I didn't understand that action.")
-
