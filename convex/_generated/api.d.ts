@@ -15,6 +15,7 @@ import type {
 } from "convex/server";
 import type * as auth from "../auth.js";
 import type * as expenses from "../expenses.js";
+import type * as feedback_mutations from "../feedback_mutations.js";
 import type * as queries from "../queries.js";
 
 /**
@@ -28,6 +29,7 @@ import type * as queries from "../queries.js";
 declare const fullApi: ApiFromModules<{
   auth: typeof auth;
   expenses: typeof expenses;
+  feedback_mutations: typeof feedback_mutations;
   queries: typeof queries;
 }>;
 export declare const api: FilterApi<

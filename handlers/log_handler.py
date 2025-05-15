@@ -1,19 +1,19 @@
 # handlers/log_handler.py
 import logging
+import re
+import json 
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, CallbackQueryHandler 
+import requests 
 
-# Local imports for refactored logic
 from services.ai_categorization_service import get_ai_category_prediction
 from utils.log_processing_utils import extract_amount_from_text, prepare_text_for_ai
-# Assuming parse_date_to_timestamp is still in the main parsing_utils
 from utils.parsing_utils import parse_date_to_timestamp 
 
 logger = logging.getLogger(__name__)
 
-# Callback data prefixes (remain the same)
 LOG_CONFIRM_YES_PREFIX = "log_confirm_yes_" 
 LOG_CONFIRM_NO_PREFIX = "log_confirm_no_"   
 CAT_OVERRIDE_PREFIX = "cat_override_"       
@@ -21,57 +21,59 @@ CAT_CANCEL_LOG_PREFIX = "cat_cancel_log_"
 
 CATEGORY_CONFIDENCE_THRESHOLD = 0.60 
 
-async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                         convex_client: any, nlp_processor: any, # nlp_processor is spaCy's nlp object
+async def process_log_request( # Renamed from log_command_v2 for clarity
+                         update: Update, 
+                         context: ContextTypes.DEFAULT_TYPE,
+                         full_text_to_parse: str, # New argument: the full text to process
+                         convex_client: any, 
+                         nlp_processor: any,
                          predefined_categories_for_buttons: dict, 
                          default_category_fallback: str, 
                          ai_service_url: str) -> None: 
+    """
+    Core logic for processing a log request, whether from /log command or command-less intent.
+    """
     telegram_chat_id = str(update.message.from_user.id)
-    full_text_after_log = update.message.text.split('/log', 1)[1].strip() if '/log' in update.message.text else ""
 
-    if not full_text_after_log:
-        await update.message.reply_text("Please provide expense details after /log...")
+    if not full_text_to_parse: # Check the passed text
+        await update.message.reply_text("No expense details provided to log.")
         return
 
-    logger.info(f"User {telegram_chat_id} /log (refactored): '{full_text_after_log}'")
-    doc = nlp_processor(full_text_after_log) # Process with spaCy once
+    logger.info(f"User {telegram_chat_id} attempting to log: '{full_text_to_parse}'")
+    doc = nlp_processor(full_text_to_parse) 
     
-    # --- Use new utility functions for parsing ---
-    amount, amount_text_for_removal = extract_amount_from_text(full_text_after_log, doc)
+    amount, amount_text_for_removal = extract_amount_from_text(full_text_to_parse, doc)
 
     if amount is None or amount <= 0:
-        await update.message.reply_text("Could not determine a valid positive amount.")
+        await update.message.reply_text("Could not determine a valid positive amount from your message.")
         return
 
-    expense_timestamp = parse_date_to_timestamp(None, full_text_after_log, nlp_processor)
+    expense_timestamp = parse_date_to_timestamp(None, full_text_to_parse, nlp_processor)
     
-    description_for_ai = prepare_text_for_ai(full_text_after_log, doc, amount_text_for_removal)
+    description_for_ai_prediction = prepare_text_for_ai(full_text_to_parse, doc, amount_text_for_removal)
     
-    # Truncate if too long for display or AI service (if it has limits)
-    description_candidate = description_for_ai
-    if len(description_candidate) > 100: 
-        description_candidate = description_candidate[:97] + "..."
-    if not description_candidate.strip(): # If cleaning resulted in empty string
-        description_candidate = "N/A"
+    final_description_for_expense = description_for_ai_prediction
+    if len(final_description_for_expense) > 100: 
+        final_description_for_expense = final_description_for_expense[:97] + "..."
+    if not final_description_for_expense.strip(): 
+        final_description_for_expense = "N/A"
 
-
-    # --- Call AI Service (from new service module) ---
-    ai_predicted_category, ai_confidence = get_ai_category_prediction(description_for_ai, ai_service_url)
+    ai_predicted_category, ai_confidence = get_ai_category_prediction(description_for_ai_prediction, ai_service_url)
 
     final_category = default_category_fallback 
     if ai_predicted_category:
         final_category = ai_predicted_category
     else: 
         logger.warning("AI service did not return a category. Using default fallback.")
-        ai_confidence = 0.0 # Treat as very low confidence
+        ai_confidence = 0.0 
 
-    # --- Prepare data for confirmation (either direct or after category override) ---
     parsed_expense_details = {
         "telegramChatId": telegram_chat_id,
         "amount": amount,
         "category": final_category, 
-        "description": description_candidate, # Use the cleaned and potentially truncated version
+        "description": final_description_for_expense, 
         "date": expense_timestamp,
+        "original_text_for_ai": description_for_ai_prediction, 
         "ai_suggested_category": ai_predicted_category, 
         "ai_confidence": ai_confidence
     }
@@ -80,7 +82,6 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
     context.chat_data[log_attempt_key] = parsed_expense_details
     logger.info(f"Stored initial parsed expense data with key: {log_attempt_key}. Data: {parsed_expense_details}")
 
-    # --- Confidence Check & User Interaction (logic remains similar) ---
     confidence_log_str = f"{ai_confidence * 100:.0f}%" if ai_confidence is not None else "N/A"
     if ai_confidence is not None and ai_confidence >= CATEGORY_CONFIDENCE_THRESHOLD:
         logger.info(f"AI confidence ({confidence_log_str}) is high. Proceeding to final confirmation.")
@@ -123,7 +124,7 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
         confidence_display_str = f"{ai_confidence*100:.0f}%" if ai_confidence is not None else "N/A"
         display_ai_suggestion = f"'{ai_cat_str}' (Confidence: {confidence_display_str})" if ai_predicted_category else "unavailable"
         
-        message_text_desc_hint = description_candidate if description_candidate != "N/A" else description_for_ai
+        message_text_desc_hint = final_description_for_expense if final_description_for_expense != "N/A" else description_for_ai_prediction
         if not message_text_desc_hint: message_text_desc_hint = "your input"
 
         message_text = (
@@ -138,21 +139,37 @@ async def log_command_v2(update: Update, context: ContextTypes.DEFAULT_TYPE,
             )
         await update.message.reply_text(message_text, reply_markup=reply_markup)
 
-# --- Callback Handlers (send_final_log_confirmation, handle_category_override_selection, handle_log_confirmation) ---
-# These functions remain largely the same as in the previous version of log_handler.py.
-# Ensure they are correctly defined here. For brevity, I'm not repeating their full code
-# if they don't have significant changes due to this specific refactor.
-# The key is that they operate on `parsed_expense_details` retrieved from `context.chat_data`
-# using `log_attempt_key`.
+# This is the actual command handler for /log
+async def log_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                         convex_client: any, nlp_processor: any,
+                         predefined_categories_for_buttons: dict, 
+                         default_category_fallback: str, 
+                         ai_service_url: str) -> None:
+    # Extract text after the /log command itself
+    full_text_after_log_command = update.message.text.split('/log', 1)[1].strip() if '/log' in update.message.text else ""
+    if not full_text_after_log_command:
+        await update.message.reply_text(
+            "Please provide expense details after /log.\n"
+            "Example: /log $20 for lunch yesterday"
+        )
+        return
+    # Call the core processing function
+    await process_log_request(update, context, full_text_after_log_command, 
+                              convex_client, nlp_processor, predefined_categories_for_buttons,
+                              default_category_fallback, ai_service_url)
 
+
+# --- Callback Handlers (send_final_log_confirmation, handle_category_override_selection, handle_log_confirmation) ---
+# These remain the same as in 
+# For brevity, not repeated here. Ensure they are present and correct.
 async def send_final_log_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                                       log_attempt_key: str, 
                                       expense_details: Dict[str, Any]):
     logger.info(f"Sending final log confirmation for key {log_attempt_key}. Details: {expense_details}")
     
     amount = expense_details.get("amount")
-    category = expense_details.get("category")
-    description = expense_details.get("description")
+    category = expense_details.get("category") 
+    description = expense_details.get("description") 
     expense_timestamp = expense_details.get("date")
 
     if None in [amount, category, description, expense_timestamp]:
@@ -168,7 +185,7 @@ async def send_final_log_confirmation(update: Update, context: ContextTypes.DEFA
     confirmation_message = (
         f"Please confirm this expense:\n\n"
         f"💰 Amount: ${amount:.2f}\n"
-        f"🏷️ Category: {category}\n"
+        f"🏷️ Category: {category}\n" 
         f"📝 Description: {description}\n" 
         f"🗓️ Date: {datetime.fromtimestamp(expense_timestamp/1000).strftime('%Y-%m-%d (%A)')}\n\n"
         f"Is this correct?"
@@ -266,38 +283,56 @@ async def handle_log_confirmation(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text(text="Sorry, something went wrong or this request expired.")
         return
 
-    expense_data_to_log: Optional[Dict[str, Any]] = context.chat_data.pop(log_attempt_key, None) 
+    full_expense_details: Optional[Dict[str, Any]] = context.chat_data.pop(log_attempt_key, None) 
 
-    if not expense_data_to_log:
+    if not full_expense_details:
         logger.error(f"Final expense data was None after pop for key: {log_attempt_key}")
         await query.edit_message_text(text="Error: Could not retrieve expense details to log.")
         return
 
     if action == "yes":
-        logger.info(f"User confirmed FINAL logging for key {log_attempt_key}. Data: {expense_data_to_log}")
-        convex_payload = {
-            "telegramChatId": expense_data_to_log["telegramChatId"],
-            "amount": expense_data_to_log["amount"],
-            "category": expense_data_to_log["category"],
-            "description": expense_data_to_log["description"], 
-            "date": expense_data_to_log["date"],
+        logger.info(f"User confirmed FINAL logging for key {log_attempt_key}. Full Details: {full_expense_details}")
+        
+        expense_to_log_payload = {
+            "telegramChatId": full_expense_details["telegramChatId"],
+            "amount": full_expense_details["amount"],
+            "category": full_expense_details["category"], 
+            "description": full_expense_details["description"], 
+            "date": full_expense_details["date"],
         }
         try:
-            result = convex_client.mutation("expenses:logExpense", convex_payload)
-            if result and result.get("success"):
-                logged_date_obj = datetime.fromtimestamp(expense_data_to_log['date'] / 1000)
+            log_result = convex_client.mutation("expenses:logExpense", expense_to_log_payload)
+            if log_result and log_result.get("success"):
+                logged_date_obj = datetime.fromtimestamp(full_expense_details['date'] / 1000)
                 await query.edit_message_text(
                     text=f"✅ Expense logged successfully!\n"
-                         f"Amount: ${expense_data_to_log['amount']:.2f}\n"
-                         f"Category: {expense_data_to_log['category']}\n"
-                         f"Description: {expense_data_to_log['description']}\n"
+                         f"Amount: ${full_expense_details['amount']:.2f}\n"
+                         f"Category: {full_expense_details['category']}\n"
+                         f"Description: {full_expense_details['description']}\n"
                          f"Date: {logged_date_obj.strftime('%Y-%m-%d (%A)')}"
                 )
-            else:
-                error_msg = result.get("error", "Failed to log expense.") if result else "Failed to log expense (no response)."
-                await query.edit_message_text(text=f"⚠️ Error: {error_msg}")
-        except Exception as e:
-            logger.error(f"Error calling Convex logExpense mutation after final confirmation: {e}")
+                
+                feedback_payload = {
+                    "telegramChatId": full_expense_details["telegramChatId"],
+                    "original_text_for_ai": full_expense_details.get("original_text_for_ai", "N/A"),
+                    "ai_predicted_category": full_expense_details.get("ai_suggested_category"), 
+                    "ai_confidence": full_expense_details.get("ai_confidence"), 
+                    "user_chosen_category": full_expense_details["category"], 
+                }
+                try:
+                    feedback_result = convex_client.mutation("feedback_mutations:recordCategoryFeedback", feedback_payload)
+                    if feedback_result and feedback_result.get("success"):
+                        logger.info(f"Category feedback recorded successfully for log_attempt_key {log_attempt_key}.")
+                    else:
+                        logger.warning(f"Failed to record category feedback for log_attempt_key {log_attempt_key}. Result: {feedback_result}")
+                except Exception as fb_e:
+                    logger.error(f"Error calling Convex recordCategoryFeedback mutation: {fb_e}")
+
+            else: 
+                error_msg = log_result.get("error", "Failed to log expense.") if log_result else "Failed to log expense (no response)."
+                await query.edit_message_text(text=f"⚠️ Error logging expense: {error_msg}")
+        except Exception as e: 
+            logger.error(f"Error calling Convex expenses:logExpense mutation after final confirmation: {e}")
             await query.edit_message_text(text=f"⚠️ An error occurred while logging your expense: {str(e)}")
     
     elif action == "no":
@@ -306,3 +341,4 @@ async def handle_log_confirmation(update: Update, context: ContextTypes.DEFAULT_
     else:
         logger.warning(f"Unknown action in final log confirmation callback: {callback_data_full}")
         await query.edit_message_text(text="Sorry, I didn't understand that action.")
+
